@@ -1,0 +1,20 @@
+---
+- name: Render RAMCloud/scripts/localconfig.py on the coordinator
+  hosts: coordinator
+  gather_facts: no
+  tasks:
+    - name: Write localconfig.py
+      template:
+        src: ../templates/localconfig.py.j2
+        dest: "{{ ramcloud_dir }}/scripts/localconfig.py"
+        mode: "0644"
+
+- name: Distribute localconfig.py to peers
+  hosts: servers
+  gather_facts: no
+  tasks:
+    - name: Copy localconfig.py from coordinator to peer
+      synchronize:
+        src: "{{ ramcloud_dir }}/scripts/localconfig.py"
+        dest: "{{ ramcloud_dir }}/scripts/localconfig.py"
+      delegate_to: "{{ groups['coordinator'][0] }}"

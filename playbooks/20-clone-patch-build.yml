@@ -1,0 +1,102 @@
+---
+- name: Clone, patch, and build RAMCloud on the coordinator
+  hosts: coordinator
+  gather_facts: yes
+  tasks:
+    - name: Mark RAMCloud tree safe for git, system-wide
+      # The tree is owned by the unprivileged user but we operate on it as
+      # root (via sudo ansible-playbook + sudo ssh). Git's CVE-2022-24765
+      # mitigation otherwise refuses to run, which breaks config.py's
+      # branch detection at cluster.py runtime. Use the system config so
+      # it works regardless of HOME (sudo without -H leaves HOME pointing
+      # at the invoking user's homedir).
+      command:
+        cmd: git config --system --add safe.directory {{ ramcloud_dir }}
+      register: gitsafe
+      changed_when: false
+
+    - name: Clone RAMCloud (and submodules)
+      git:
+        repo: "{{ ramcloud_repo }}"
+        dest: "{{ ramcloud_dir }}"
+        version: "{{ ramcloud_branch }}"
+        recursive: yes
+        update: no   # don't blow away local patches on rerun
+
+    - name: Find all .py files in RAMCloud (excluding vendored gtest)
+      find:
+        paths:
+          - "{{ ramcloud_dir }}"
+        patterns: "*.py"
+        recurse: yes
+        excludes: []
+      register: py_files
+
+    - name: Patch python shebangs from "python" to "python2"
+      replace:
+        path: "{{ item.path }}"
+        regexp: '^#!/usr/bin/env python$'
+        replace: '#!/usr/bin/env python2'
+      loop: "{{ py_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: "'/gtest/' not in item.path and '/logcabin/gtest/' not in item.path"
+
+    - name: Copy source patches to coordinator
+      copy:
+        src: "../patches/{{ item }}"
+        dest: "{{ ramcloud_dir }}/.ansible-{{ item }}"
+      loop:
+        - 02-runtime-options-access.patch
+        - 03-remoteexec-stdin.patch
+        - 04-cluster-logdir-fanout.patch
+
+    - name: Apply source patches (idempotent — skip if already applied)
+      shell: |
+        if patch -p1 --dry-run --reverse --silent < "{{ ramcloud_dir }}/.ansible-{{ item }}" >/dev/null 2>&1; then
+          echo "already-applied"
+        else
+          patch -p1 < "{{ ramcloud_dir }}/.ansible-{{ item }}"
+        fi
+      args:
+        chdir: "{{ ramcloud_dir }}"
+      register: patch_result
+      changed_when: "'already-applied' not in patch_result.stdout"
+      loop:
+        - 02-runtime-options-access.patch
+        - 03-remoteexec-stdin.patch
+        - 04-cluster-logdir-fanout.patch
+
+    - name: Detect nproc for parallel build
+      command: nproc
+      register: nproc_out
+      changed_when: false
+
+    - name: Build RAMCloud (first pass)
+      command: >-
+        make ZOOKEEPER_LIB=-lzookeeper_mt -j{{ nproc_out.stdout }}
+      args:
+        chdir: "{{ ramcloud_dir }}"
+        creates: "{{ ramcloud_dir }}/obj.{{ ramcloud_branch }}/coordinator"
+      register: build_first
+      failed_when: false
+
+    - name: Build RAMCloud (retry with -Wno-error if first pass failed)
+      command: >-
+        make ZOOKEEPER_LIB=-lzookeeper_mt
+        EXTRACXXFLAGS=-Wno-error\ -Wno-deprecated-declarations
+        -j{{ nproc_out.stdout }}
+      args:
+        chdir: "{{ ramcloud_dir }}"
+        creates: "{{ ramcloud_dir }}/obj.{{ ramcloud_branch }}/coordinator"
+      when: build_first.rc is defined and build_first.rc != 0
+
+    - name: Verify coordinator binary exists
+      stat:
+        path: "{{ ramcloud_dir }}/obj.{{ ramcloud_branch }}/coordinator"
+      register: coord_bin
+
+    - name: Fail loudly if build did not produce a coordinator binary
+      assert:
+        that: coord_bin.stat.exists
+        fail_msg: "build did not produce {{ ramcloud_dir }}/obj.{{ ramcloud_branch }}/coordinator"

@@ -1,0 +1,75 @@
+---
+- name: Clean up stale RAMCloud processes and backup files on every host
+  hosts: ramcloud
+  gather_facts: no
+  tasks:
+    - name: Kill any leftover coordinator/server/ClusterPerf processes
+      # `pkill -x` matches comm exactly (basename only), so it won't
+      # self-match the ssh command line. Exit 1 = "no match" is fine.
+      command: "pkill -9 -x {{ item }}"
+      loop:
+        - coordinator
+        - server
+        - ClusterPerf
+      register: pk
+      failed_when: pk.rc not in [0, 1]
+      changed_when: pk.rc == 0
+
+    - name: Remove stale backup files
+      file:
+        path: "{{ ramcloud_backup_file }}"
+        state: absent
+
+- name: Launch the cluster and run the ClusterPerf basic smoke test
+  hosts: coordinator
+  gather_facts: no
+  vars:
+    n_servers: "{{ groups['servers'] | length }}"
+    client_cmd: "obj.{{ ramcloud_branch }}/apps/ClusterPerf basic"
+  tasks:
+    - name: Run cluster.py with smoke-test client
+      # cluster.py exits 1 on benign teardown warnings; we ignore exit code
+      # and check the client log content for the verdict.
+      command: >-
+        python2 scripts/cluster.py
+        --servers={{ n_servers }}
+        --replicas=1
+        --transport={{ ramcloud_transport }}
+        --timeout=300
+        --client={{ client_cmd | quote }}
+      args:
+        chdir: "{{ ramcloud_dir }}"
+      environment:
+        HOME: /root
+      register: cluster_run
+      failed_when: false
+      changed_when: false
+
+    # cluster.py picks the LAST host in getHosts() as the coordinator
+    # process host (where coordinator + client run). With our inventory
+    # that's the last entry in groups['ramcloud'].
+    - name: Identify coordinator-process host
+      set_fact:
+        coord_proc_host: "{{ groups['ramcloud'] | last }}"
+
+    - name: Find latest log directory on the coordinator-process host
+      shell: ls "{{ ramcloud_dir }}/logs/" | grep -E '^[0-9]{14}$' | sort | tail -1
+      delegate_to: "{{ coord_proc_host }}"
+      register: latest_log_ts
+      changed_when: false
+
+    - name: Slurp the client log from the coordinator-process host
+      slurp:
+        src: "{{ ramcloud_dir }}/logs/{{ latest_log_ts.stdout }}/client1.{{ coord_proc_host }}.log"
+      delegate_to: "{{ coord_proc_host }}"
+      register: client_log
+
+    - name: Print last 60 lines of the client log
+      debug:
+        msg: "{{ (client_log.content | b64decode).split('\n')[-60:] }}"
+
+    - name: Assert smoke test ran the 1MB write benchmark
+      assert:
+        that: "'basic.writeBw1M' in (client_log.content | b64decode)"
+        fail_msg: "ClusterPerf basic did not complete (no basic.writeBw1M line)"
+        success_msg: "=== SMOKE TEST PASSED ==="

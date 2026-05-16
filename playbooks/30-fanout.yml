@@ -1,0 +1,20 @@
+---
+- name: Fan out the built RAMCloud tree to every server peer
+  hosts: servers
+  gather_facts: no
+  tasks:
+    - name: Ensure target directory exists on peer
+      file:
+        path: "{{ ramcloud_dir }}"
+        state: directory
+
+    - name: Rsync RAMCloud/ from coordinator -> peer (push from coordinator)
+      ansible.posix.synchronize:
+        src: "{{ ramcloud_dir }}/"
+        dest: "{{ ramcloud_dir }}/"
+        delete: yes
+        recursive: yes
+        # Use ssh as root (we are already root on the controller).
+        rsync_opts:
+          - "--exclude=logs"
+      delegate_to: "{{ groups['coordinator'][0] }}"

@@ -1,0 +1,27 @@
+diff --git a/scripts/remoteexec.py b/scripts/remoteexec.py
+index 473c0f0d..a4f2b2d2 100755
+--- a/scripts/remoteexec.py
++++ b/scripts/remoteexec.py
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env python
++#!/usr/bin/env python2
+ # Copyright (c) 2010 Stanford University
+ #
+ # Permission to use, copy, modify, and distribute this software for any
+@@ -48,10 +48,9 @@ if __name__ == '__main__':
+         os.chdir(sys.argv[2])
+     command = ['bash', '-c', sys.argv[1]]
+     p = subprocess.Popen(command)
+-    signal.signal(signal.SIGCHLD, lambda signum, frame: sys.exit(p.wait()))
+-
+-    r = sys.stdin.read()
+-    assert r == ''
+-    # stdin was closed, user aborted
+-    p.kill()
+-    sys.exit(1)
++    # Just wait for the child to exit. The original code killed the child
++    # whenever stdin reached EOF (to abort cleanly when an interactive ssh
++    # client closed), but that fires immediately when we run from a
++    # non-interactive shell -- killing short commands like ensureServers
++    # before they finish.
++    sys.exit(p.wait())

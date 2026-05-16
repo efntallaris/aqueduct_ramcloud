@@ -1,0 +1,8 @@
+---
+# End-to-end RAMCloud setup. Runs the five sub-playbooks in order.
+# Each one is also runnable standalone.
+- import_playbook: playbooks/10-deps.yml
+- import_playbook: playbooks/20-clone-patch-build.yml
+- import_playbook: playbooks/30-fanout.yml
+- import_playbook: playbooks/40-config.yml
+- import_playbook: playbooks/50-smoke-test.yml

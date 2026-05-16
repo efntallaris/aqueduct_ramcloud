@@ -1,90 +1,79 @@
-# ramcloud-cloudlab
+# aqueduct_ramcloud
 
-End-to-end driver for cloning, building, and smoke-testing
+Ansible playbooks that clone, patch, build, and smoke-test
 [PlatformLab/RAMCloud](https://github.com/PlatformLab/RAMCloud) on a
 CloudLab `redisN` cluster running Ubuntu 22.04.
 
-The upstream RAMCloud repo is archived and was last tested on Ubuntu Trusty
-with gcc-4.x. This driver applies the patches needed to build it on a modern
-toolchain (gcc-11, Python 3) and runs the bundled `ClusterPerf basic`
-benchmark across all detected peer nodes.
+The upstream repo is archived and last targeted Ubuntu Trusty / gcc-4.x;
+these playbooks apply the patches needed for gcc-11, Python 3, and
+RoCE-mode Mellanox NICs, then run `ClusterPerf basic` across the cluster.
 
-## What it does
+## Requirements
 
-```
-setup_ramcloud.sh
-├── 1. detect_nodes.sh     parse /etc/hosts for redisN, probe via `sudo ssh`
-├── 2. install_deps.sh     apt deps on this node
-├── 3. install_deps.sh     apt deps on every peer (over sudo ssh)
-├── 4. git clone RAMCloud + submodules
-├── 4b.patch python shebangs (python -> python2) across the tree
-├── 5. make ZOOKEEPER_LIB=-lzookeeper_mt -j$(nproc)
-│         (retries with -Wno-error if first pass fails)
-├── 6. sudo rsync RAMCloud/ to every peer at the same absolute path
-├── 7. write RAMCloud/scripts/localconfig.py with the detected host list
-└── 8. run_cluster.sh: cluster.py + obj.master/apps/ClusterPerf basic
-```
-
-## Assumptions
-
-- Ubuntu 22.04 on every node.
-- Hostnames `redis0..redisN` resolvable via `/etc/hosts` (CloudLab default).
-- Passwordless `sudo` locally.
-- `/root/.ssh/id_rsa` provisioned on every node by the CloudLab profile, so
-  `sudo ssh redisX` works root-to-root. The invoking user's account does
-  *not* need an ssh key.
-- The cluster's NICs are ConnectX-4 Lx in Ethernet/RoCE mode (no native
-  Infiniband subnet manager). The default transport is therefore `tcp`,
-  not `basic+infud`.
-- Filesystem is **not** NFS-shared; the driver fans the built tree out to
-  every peer via `sudo rsync`.
-
-## Running
-
-```bash
-# Full pipeline (deps + clone + build + run smoke test).
-bash setup_ramcloud.sh
-
-# Skip phases that have already succeeded.
-SKIP_DEPS=1                bash setup_ramcloud.sh
-SKIP_DEPS=1 SKIP_BUILD=1   bash setup_ramcloud.sh
-SKIP_RUN=1                 bash setup_ramcloud.sh   # build only
-
-# Override the cluster step.
-TRANSPORT=basic+udp        bash scripts/run_cluster.sh
-CLIENT='obj.master/apps/ClusterPerf readDist'  bash scripts/run_cluster.sh
-```
-
-A successful run ends with `=== SMOKE TEST PASSED ===` and the
-`ClusterPerf basic` summary (read/write latency and bandwidth per object
-size) is in `RAMCloud/logs/latest/client1.<coordinator-host>.log` on the
-coordinator node.
-
-## Patches applied to RAMCloud at clone time
-
-The cloned tree gets four small in-place patches before it builds:
-
-| File | Patch |
-| --- | --- |
-| `scripts/*.py`, `pragmas.py`, `bindings/`, `systemtests/`, `benchmarks/` | Shebang `python` → `python2`; on Ubuntu 22.04 `python` is Python 3 and these scripts use `import commands` / Py2 print statements. |
-| `src/RuntimeOptions.h` | Move the nested `Parseable` struct from `PRIVATE:` to `PUBLIC:`; gcc-11 enforces nested-type access where older gccs let it slide. |
-| `scripts/remoteexec.py` | Remove the kill-on-stdin-EOF behavior, which fires immediately when the cluster driver runs non-interactively and kills short commands like `ensureServers` before they finish. |
-| `scripts/cluster.py` | Fan-out `mkdir -p logs/<timestamp>/perfcounters` to every peer over ssh, because the filesystem isn't NFS-shared. |
-
-The shebang patch is re-applied automatically on every run; the other
-three are applied once after the initial `git clone`.
+- Ansible 2.10+ on the control node (`apt install ansible`).
+- 5 Ubuntu 22.04 nodes named `redis0..redis4` reachable over an internal
+  network (default CloudLab profile is fine).
+- `/root/.ssh/id_rsa` provisioned on the control node and `authorized_keys`
+  set up on every peer (the CloudLab default does this automatically).
+- Passwordless `sudo` on the control node.
 
 ## Layout
 
 ```
 .
-├── setup_ramcloud.sh                  # top-level driver
-├── scripts/
-│   ├── detect_nodes.sh                # writes nodes.txt
-│   ├── install_deps.sh                # idempotent apt install (root)
-│   ├── make_localconfig.py            # writes RAMCloud/scripts/localconfig.py
-│   └── run_cluster.sh                 # cleans up stale procs, runs cluster.py
-├── RAMCloud/                          # cloned source tree (gitignored)
-├── nodes.txt                          # detected host list (gitignored)
-└── setup_logs/                        # build + driver logs (gitignored)
+├── ansible.cfg
+├── inventory.ini                 # static, redis0..redis4 grouped
+├── site.yml                      # full pipeline (imports all 5 plays)
+├── playbooks/
+│   ├── 10-deps.yml               # apt deps on every host
+│   ├── 20-clone-patch-build.yml  # clone + in-tree patches + make
+│   ├── 30-fanout.yml             # rsync built tree to peers
+│   ├── 40-config.yml             # render localconfig.py from inventory
+│   └── 50-smoke-test.yml         # cleanup + cluster.py + assert
+├── templates/
+│   └── localconfig.py.j2
+├── patches/
+│   ├── 02-runtime-options-access.patch
+│   ├── 03-remoteexec-stdin.patch
+│   └── 04-cluster-logdir-fanout.patch
+└── README.md
 ```
+
+## Running
+
+```bash
+# Full pipeline (deps -> clone -> build -> rsync -> config -> smoke test).
+sudo ansible-playbook site.yml
+
+# Any single phase, standalone:
+sudo ansible-playbook playbooks/10-deps.yml
+sudo ansible-playbook playbooks/20-clone-patch-build.yml
+sudo ansible-playbook playbooks/50-smoke-test.yml
+
+# Override defaults (transport, backup file, branch) inline.
+sudo ansible-playbook site.yml -e ramcloud_transport=basic+udp
+```
+
+`ansible-playbook` must be invoked with `sudo` because it reads
+`/root/.ssh/id_rsa` to ssh to peers as root. The user's own account is
+not expected to have an ssh key.
+
+A successful run ends with the `=== SMOKE TEST PASSED ===` assertion and
+prints the last 60 lines of the `ClusterPerf basic` output (per-object-size
+read/write latency and bandwidth).
+
+## What the playbooks patch in RAMCloud
+
+| Patch | Why |
+| --- | --- |
+| `02-runtime-options-access.patch` | gcc-11 enforces nested-type access; promotes `RuntimeOptions::Parseable` to PUBLIC. |
+| `03-remoteexec-stdin.patch` | Removes kill-on-stdin-EOF, which fires immediately in non-interactive ssh and kills short commands like `ensureServers`. |
+| `04-cluster-logdir-fanout.patch` | `cluster.py` creates `logs/<ts>/` only locally; this fans it out to peers (the filesystem isn't NFS-shared on CloudLab). |
+| shebang fix (in playbook) | `#!/usr/bin/env python` → `python2` across the tree; Ubuntu 22.04's `python` is python3, and these scripts use `import commands` / py2 print. |
+
+## Defaults & overrides
+
+The transport defaults to `tcp`. The cluster's ConnectX-4 Lx cards are in
+Ethernet/RoCE mode with no subnet manager, so `basic+infud` won't work
+here (results in `lid=0` failures). Override via
+`-e ramcloud_transport=...` if you've got native IB.
